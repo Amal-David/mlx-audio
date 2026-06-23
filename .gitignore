@@ -49,7 +49,7 @@ claude.md
 .generated/legacy-docs-generated/
 
 # optimized-fork local artifacts
-outputs/
-models/
+/outputs/
+/models/
 *.wav
 *.mp3
