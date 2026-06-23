@@ -7,7 +7,7 @@ Recipe (verified to keep generation healthy — uniform 4-bit breaks EOS because
   - bf16       : output head, MoE router, gater, per-head temp, RMSNorm, ChunkedLinear
 
 Run:
-    pip install git+https://github.com/lucasnewman/mlx-audio.git@zonos2-stream-and-batching
+    pip install git+https://github.com/Amal-David/mlx-audio.git@zonos2-optimized
     python quantize.py --out Zyphra-ZONOS2-4bit
 """
 from __future__ import annotations

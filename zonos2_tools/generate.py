@@ -1,7 +1,7 @@
 """ZONOS2-4bit (MLX) — single-stream, voice cloning, and long-form examples.
 
 Requires mlx-audio with ZONOS2 support:
-    pip install git+https://github.com/lucasnewman/mlx-audio.git@zonos2-stream-and-batching
+    pip install git+https://github.com/Amal-David/mlx-audio.git@zonos2-optimized
 
 Run:
     python generate.py
