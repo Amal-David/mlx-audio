@@ -47,3 +47,9 @@ output/
 claude.md
 .claude/site/
 .generated/legacy-docs-generated/
+
+# optimized-fork local artifacts
+outputs/
+models/
+*.wav
+*.mp3
