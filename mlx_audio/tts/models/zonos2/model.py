@@ -18,6 +18,7 @@ from .generation import (
     Zonos2GenerationState,
     format_duration,
     sample_frame,
+    sample_frame_device,
 )
 from .prompt import TTSPromptBuilder, TTSPromptConfig, shear_up
 from .textnorm import TTSTextNormalizer
@@ -831,21 +832,65 @@ class Model(nn.Module):
         step: int,
         seed: Optional[int],
     ) -> list[list[int]]:
-        mx.eval(last_logits)
         text_vocab = int(self.config.text_vocab)
         inactive_frame = [self.config.eoa_id] * self.config.n_codebooks + [text_vocab]
-        frames = []
+        batch_size = len(states)
+        # Sample every active sequence ON-DEVICE (no per-sequence sync), then stack and
+        # sync ONCE. Previously this did one `.tolist()` per sequence per step (B syncs);
+        # at large batch that host serialization dominated. Math/keys are unchanged.
+        device_ids: list[Optional[mx.array]] = [None] * batch_size
         for idx, state in enumerate(states):
             if finished[idx]:
-                frames.append(inactive_frame)
                 continue
             sample_key = (
-                mx.random.key(int(seed) + step * len(states) + idx)
+                mx.random.key(int(seed) + step * batch_size + idx)
                 if seed is not None
                 else None
             )
-            frames.append(sample_frame(last_logits[idx], state, params, key=sample_key))
+            device_ids[idx] = sample_frame_device(
+                last_logits[idx], state, params, key=sample_key
+            )
+
+        active = [d for d in device_ids if d is not None]
+        rows = iter(mx.stack(active, axis=0).tolist()) if active else iter(())
+        frames = []
+        for ids in device_ids:
+            if ids is None:
+                frames.append(list(inactive_frame))
+            else:
+                frames.append([int(t) for t in next(rows)] + [text_vocab])
         return frames
+
+    def _sample_active_frames(
+        self,
+        active_logits: mx.array,
+        active_states: Sequence[Zonos2GenerationState],
+        active_orig: Sequence[int],
+        params: TTSSamplingParams,
+        *,
+        step: int,
+        full_batch_size: int,
+        seed: Optional[int],
+    ) -> list[list[int]]:
+        """Sample the currently-active rows of a ragged batch (one sync/step).
+
+        RNG keys use the ORIGINAL row index and the ORIGINAL batch size, so the result is
+        identical to dense batch decode regardless of which rows have been compacted away.
+        """
+        text_vocab = int(self.config.text_vocab)
+        device_ids = []
+        for pos, state in enumerate(active_states):
+            orig = active_orig[pos]
+            sample_key = (
+                mx.random.key(int(seed) + step * full_batch_size + orig)
+                if seed is not None
+                else None
+            )
+            device_ids.append(
+                sample_frame_device(active_logits[pos], state, params, key=sample_key)
+            )
+        rows = mx.stack(device_ids, axis=0).tolist()  # single sync for all active rows
+        return [[int(t) for t in row] + [text_vocab] for row in rows]
 
     def generate(
         self,
@@ -1126,26 +1171,37 @@ class Model(nn.Module):
             )
             for _ in range(batch_size)
         ]
-        finished = [False] * batch_size
-
+        # Ragged / continuous batching: drop each sequence from the active set the moment it
+        # finishes, so the GPU never forwards already-completed rows (on mixed-length sets that
+        # is 35-50% of the work). Attention is per-row causal, so an active row's logits do not
+        # depend on which other rows are present; RNG keys use the ORIGINAL index + original
+        # batch size. Output is therefore byte-identical to dense batch decode.
+        active = list(range(batch_size))  # original indices still generating, in batch order
         for step in range(int(limit)):
-            frames = self._sample_batch_frames(
-                last_logits,
-                states,
-                params,
-                finished,
-                step=step,
-                seed=seed,
+            frames = self._sample_active_frames(
+                last_logits, [states[i] for i in active], active,
+                params, step=step, full_batch_size=batch_size, seed=seed,
             )
-            for idx, frame in enumerate(frames):
-                if finished[idx]:
-                    continue
-                states[idx].append(frame, ignore_eos=params.ignore_eos)
-                finished[idx] = states[idx].finished
-            if all(finished):
+            keep_pos = []
+            for pos, orig in enumerate(active):
+                states[orig].append(frames[pos], ignore_eos=params.ignore_eos)
+                if not states[orig].finished:
+                    keep_pos.append(pos)
+            if not keep_pos:
                 break
 
-            next_ids = mx.array(frames, dtype=mx.int32)[:, None, :]
+            if len(keep_pos) < len(active):
+                keep_idx = mx.array(keep_pos, dtype=mx.int32)
+                for c in cache:
+                    c.keys = c.keys[keep_idx]
+                    c.values = c.values[keep_idx]
+                    c.offset = c.offset[keep_idx]
+                    c.left_padding = c.left_padding[keep_idx]
+                active = [active[p] for p in keep_pos]
+                next_ids = mx.array([frames[p] for p in keep_pos], dtype=mx.int32)[:, None, :]
+            else:
+                next_ids = mx.array(frames, dtype=mx.int32)[:, None, :]
+
             logits = self(next_ids, cache=cache)
             last_logits = logits[:, -1]
 

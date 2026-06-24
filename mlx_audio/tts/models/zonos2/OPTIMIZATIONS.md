@@ -77,12 +77,44 @@ Runnable scripts in [`zonos2_tools/`](./zonos2_tools): `generate.py` (single / c
 
 ---
 
+## Implemented decode-loop optimizations
+- **On-device batch sampling (single sync/step).** The reference samples each sequence in a
+  Python loop, each doing its own `.tolist()` GPU→CPU sync — **B syncs per step**, which serialized
+  the GPU at large batch (throughput plateaued ~B=64). We sample every sequence on-device and sync
+  **once** per step (`sample_frame_device` → stack → one `.tolist()`). Math and RNG keys are
+  unchanged, so output is **byte-identical** (verified MAE = 0). Measured on M4 Pro (4-bit, ignore-eos):
+
+  | Batch | before | after | gain |
+  |---|---|---|---|
+  | 16 | 2.68× | **3.36×** | +25% |
+  | 32 | 3.37× | **4.04×** | +20% |
+  | 64 | 3.79× | **4.27×** | +13% |
+  | 96 | 3.79× (plateau) | **4.35×** | +15% |
+
+- **Vectorized repetition penalty.** Replaced the per-codebook Python set loop with one on-device
+  scatter — byte-identical, removes per-step host work (helps most at large batch).
+
+- **Ragged / continuous batching (drop finished rows).** On mixed-length batches the dense loop runs
+  every row until the *longest* finishes — 35–55% of forwards are wasted on already-completed rows.
+  We compact the batch (slice the KV-cache batch axis + states) the moment a row hits EOS, keying RNG
+  by original index so output is **byte-identical** (verified MAE = 0 on all sequences). Measured on
+  M4 Pro (4-bit, real-EOS, B=48 mixed-length): **197.4 s → 110.8 s wall = 1.78× faster** (1.25× →
+  2.22× aggregate real-time). The gain grows with batch size; at B=8 it is negligible because the
+  forward is dispatch-bound, not compute-bound, at small batch.
+
+> **Honest ceiling note.** A further *5×* on **single-stream** is not reachable without retraining —
+> RTF 0.16 sits below the ~0.26 weight-bandwidth floor (273 GB/s, ~810 MB/token). Single-stream
+> pure-inference headroom is ~2.3× (forward-bound). The reachable wins are on **batch throughput**
+> (this section) toward a ~10–14× aggregate ceiling.
+
 ## Roadmap (further speedups — not yet done)
-1. **Decode-loop de-serialization** — on-device sampling, remove the per-frame `.tolist()` sync,
-   `mx.async_eval` pipeline, `mx.compile`. Expected ~1.5–1.9× single-stream.
-2. **Quantize `ChunkedLinear` (wkv/w_in)** — currently bf16; adding a `to_quantized` ≈ +17% forward.
-3. **Ragged-batch compaction** — drop finished rows so a batch isn't paced by its slowest sequence.
-4. **Speculative / multi-token decode** on the 9-codebook delay axis — the path to 4–5× single-stream.
+1. **Single-stream decode pipelining** — `mx.async_eval` + `mx.compile` of the per-step forward+sample
+   to recover serialization on the single-stream path (forward-bound at RTF ~0.82; ~1.3–1.6×).
+2. **Full batch-sampler vectorization** — fold the per-sequence penalty/filtering into one
+   `[B, n_cb, vocab]` op (only the categorical stays per-key) to cut the remaining per-step Python.
+3. **Quantize `ChunkedLinear` (wkv/w_in)** — currently bf16; adding a `to_quantized` ≈ +17% forward.
+4. **Speculative / multi-token decode** — needs lightweight trained draft heads (backbone frozen);
+   ~2–3× single-stream on this hardware, not the CUDA-paper 4–5× (no tree-attention kernel in MLX).
 
 ## Credits & license
 - **Model:** [Zyphra/ZONOS2](https://huggingface.co/Zyphra/ZONOS2)

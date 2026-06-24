@@ -71,23 +71,21 @@ def _apply_repetition_penalty(
     else:
         limit = min(n_codebooks, int(repetition_codebooks))
     recent = generated[-int(window) :]
-    vocab = mx.arange(vocab_size)
-    rows = []
-    for cb in range(limit):
-        seen = {
-            int(row[cb])
-            for row in recent
-            if cb < len(row) and 0 <= int(row[cb]) < vocab_size
-        }
-        row = logits[cb]
-        if seen:
-            token_ids = mx.array(sorted(seen), dtype=mx.int32)
-            mask = mx.any(vocab[None, :] == token_ids[:, None], axis=0)
-            penalized = mx.where(row > 0, row / penalty, row * penalty)
-            row = mx.where(mask, penalized, row)
-        rows.append(row)
-    rows.extend(logits[cb] for cb in range(limit, n_codebooks))
-    return mx.stack(rows, axis=0)
+    # Vectorized, on-device equivalent of the per-codebook Python set loop.
+    # rec[r, cb] = token sampled for codebook cb in recent frame r (fill -1 if missing).
+    # Tokens outside [0, vocab) -- including the -1 fill -- match nothing, which is
+    # exactly the previous `0 <= tok < vocab_size` set filter. Result is identical.
+    rec = mx.array(
+        [[row[cb] if cb < len(row) else -1 for cb in range(limit)] for row in recent],
+        dtype=mx.int32,
+    )  # [R, limit]
+    mask = mx.any(
+        rec[:, :, None] == mx.arange(vocab_size)[None, None, :], axis=0
+    )  # [limit, vocab] -- token t penalized in codebook cb iff it appears in the window
+    head = logits[:limit]
+    penalized = mx.where(head > 0, head / penalty, head * penalty)
+    head = mx.where(mask, penalized, head)
+    return mx.concatenate([head, logits[limit:]], axis=0)
 
 
 def _apply_top_k(logits: mx.array, top_k: int) -> mx.array:
@@ -122,12 +120,18 @@ def _apply_min_p(probs: mx.array, min_p: float) -> mx.array:
     return _normalize_probs(out)
 
 
-def sample_frame(
+def sample_frame_device(
     logits: mx.array,
     state: Zonos2GenerationState,
     params: TTSSamplingParams,
     key: Optional[mx.array] = None,
-) -> list[int]:
+) -> mx.array:
+    """Sample one frame and return the codebook ids ON-DEVICE (mx.array[n_codebooks]).
+
+    Identical math to ``sample_frame`` but defers the GPU->CPU sync. Batch decode
+    stacks these across the batch and syncs once, instead of one ``.tolist()`` per
+    sequence per step.
+    """
     logits = mx.array(logits, dtype=mx.float32)
     if logits.ndim != 2:
         raise ValueError(f"logits must be [codebooks, vocab], got {logits.shape}")
@@ -141,28 +145,34 @@ def sample_frame(
     )
 
     if params.temperature <= 1e-8:
-        ids = mx.argmax(logits, axis=-1).astype(mx.int32)
-    else:
-        filtered = logits / float(params.temperature)
-        filtered = _apply_top_k(filtered, int(params.top_k))
-        probs = mx.softmax(filtered, axis=-1)
-        probs = _apply_top_p(probs, float(params.top_p))
-        probs = _apply_min_p(probs, float(params.min_p))
-        finite = mx.all(mx.isfinite(probs), axis=-1)
-        positive = mx.sum(probs, axis=-1) > 0
-        valid = finite & positive
-        safe_probs = mx.where(mx.isfinite(probs), probs, 0.0)
-        sample_logits = mx.where(
-            valid[:, None],
-            mx.log(mx.maximum(safe_probs, 1e-20)),
-            mx.zeros_like(filtered),
-        )
-        sampled = mx.random.categorical(sample_logits, axis=-1, key=key).astype(
-            mx.int32
-        )
-        greedy = mx.argmax(filtered, axis=-1).astype(mx.int32)
-        ids = mx.where(valid, sampled, greedy)
+        return mx.argmax(logits, axis=-1).astype(mx.int32)
 
+    filtered = logits / float(params.temperature)
+    filtered = _apply_top_k(filtered, int(params.top_k))
+    probs = mx.softmax(filtered, axis=-1)
+    probs = _apply_top_p(probs, float(params.top_p))
+    probs = _apply_min_p(probs, float(params.min_p))
+    finite = mx.all(mx.isfinite(probs), axis=-1)
+    positive = mx.sum(probs, axis=-1) > 0
+    valid = finite & positive
+    safe_probs = mx.where(mx.isfinite(probs), probs, 0.0)
+    sample_logits = mx.where(
+        valid[:, None],
+        mx.log(mx.maximum(safe_probs, 1e-20)),
+        mx.zeros_like(filtered),
+    )
+    sampled = mx.random.categorical(sample_logits, axis=-1, key=key).astype(mx.int32)
+    greedy = mx.argmax(filtered, axis=-1).astype(mx.int32)
+    return mx.where(valid, sampled, greedy)
+
+
+def sample_frame(
+    logits: mx.array,
+    state: Zonos2GenerationState,
+    params: TTSSamplingParams,
+    key: Optional[mx.array] = None,
+) -> list[int]:
+    ids = sample_frame_device(logits, state, params, key=key)
     return [int(token) for token in ids.tolist()] + [int(state.text_vocab)]
 
 
