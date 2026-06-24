@@ -97,10 +97,14 @@ Runnable scripts in [`zonos2_tools/`](./zonos2_tools): `generate.py` (single / c
 - **Ragged / continuous batching (drop finished rows).** On mixed-length batches the dense loop runs
   every row until the *longest* finishes — 35–55% of forwards are wasted on already-completed rows.
   We compact the batch (slice the KV-cache batch axis + states) the moment a row hits EOS, keying RNG
-  by original index so output is **byte-identical** (verified MAE = 0 on all sequences). Measured on
-  M4 Pro (4-bit, real-EOS, B=48 mixed-length): **197.4 s → 110.8 s wall = 1.78× faster** (1.25× →
-  2.22× aggregate real-time). The gain grows with batch size; at B=8 it is negligible because the
-  forward is dispatch-bound, not compute-bound, at small batch.
+  by original index. Measured fork-vs-clone (4-bit, real-EOS, M4 Pro): **80.0 s → 56.6 s = 1.41× at
+  B=32**, up to **~1.78× at B=48** (workload-dependent — more length skew reclaims more waste). At
+  B=8 the gain is negligible (the forward is dispatch-bound, not compute-bound, at small batch).
+  **Not bit-exact** (important caveat): for most sequences output is identical, but the *longest*
+  surviving sequence finishes alone (B=1) after the others are compacted away, and a B=1 matmul
+  rounds slightly differently than a B=8 one — the AR loop amplifies that into a *different but
+  equally-valid* sample. So this is a lossy-but-quality-preserving optimization, not a bit-exact one.
+  (Verified: 7/8 sequences identical, only the longest diverged, same length, perceptually equivalent.)
 
 > **Honest ceiling note.** A further *5×* on **single-stream** is not reachable without retraining —
 > RTF 0.16 sits below the ~0.26 weight-bandwidth floor (273 GB/s, ~810 MB/token). Single-stream
